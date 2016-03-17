@@ -8,6 +8,16 @@ from qiniu import config
 from .auth import RequestsAuth
 from . import __version__
 
+from tornado import gen
+from tornado import httpclient
+
+try:
+    from mimetools import choose_boundary
+except ImportError:
+    from email.generator import _make_boundary as choose_boundary
+
+from requests.packages.urllib3.fields import RequestField
+from requests.packages.urllib3.filepost import encode_multipart_formdata
 
 _sys_info = '{0}; {1}'.format(platform.system(), platform.machine())
 _python_ver = platform.python_version()
@@ -15,6 +25,7 @@ _python_ver = platform.python_version()
 USER_AGENT = 'QiniuPython/{0} ({1}; ) Python/{2}'.format(__version__, _sys_info, _python_ver)
 
 _session = None
+_http = None
 _headers = {'User-Agent': USER_AGENT}
 
 
@@ -34,17 +45,30 @@ def _init():
     global _session
     _session = session
 
+    global _http
+    _http = httpclient.AsyncHTTPClient()
 
-def _post(url, data, files, auth):
-    if _session is None:
+@gen.coroutine
+def _post(url, params, files, auth):
+    if _http is None:
         _init()
     try:
-        r = _session.post(
-            url, data=data, files=files, auth=auth, headers=_headers, timeout=config.get_default('connection_timeout'))
-    except Exception as e:
-        return None, ResponseInfo(None, e)
-    return __return_wrapper(r)
+        form = UploadForm()
+        if params:
+            [form.add_field(name, value) for name, value in params.items()]
+        form.files = files
+        body, content_type = form.encode_body()
 
+        headers = _headers
+        headers["Content-Type"] = content_type
+
+        r = yield _http.fetch(
+            url, method="POST", headers=headers, body=body, connect_timeout=config.get_default('connection_timeout'))
+
+    except Exception as e:
+        raise gen.Return((r, None, ResponseInfo(None, e)))
+
+    raise gen.Return((r, ResponseInfo(r)))
 
 def _get(url, params, auth):
     try:
@@ -101,8 +125,8 @@ class ResponseInfo(object):
             self.x_log = None
             self.error = str(exception)
         else:
-            self.status_code = response.status_code
-            self.text_body = response.text
+            self.status_code = response.code
+            self.text_body = response.body
             self.req_id = response.headers.get('X-Reqid')
             self.x_log = response.headers.get('X-Log')
             if self.status_code >= 400:
@@ -131,3 +155,63 @@ class ResponseInfo(object):
 
     def __repr__(self):
         return self.__str__()
+
+
+class UploadForm(object):
+    def __init__(self):
+        self.form_fields = []
+        self.files = {}
+        self.boundary = choose_boundary()
+        self.content_type = 'multipart/form-data'
+        return
+
+    def get_content_type(self):
+        return self.content_type
+
+    def add_field(self, name, value):
+        self.form_fields.append((str(name), str(value)))
+        return
+
+    def encode_body(self):
+        new_fields = []
+        for field, val in self.form_fields:
+            if isinstance(val, basestring) or not hasattr(val, '__iter__'):
+                val = [val]
+            for v in val:
+                if v is not None:
+                    # Don't call str() on bytestrings: in Py3 it all goes wrong.
+                    if not isinstance(v, bytes):
+                        v = str(v)
+
+                    new_fields.append(
+                        (field.decode('utf-8') if isinstance(field, bytes) else field,
+                         v.encode('utf-8') if isinstance(v, str) else v))
+        if not self.files:
+            self.files = {}
+        for k, v in self.files.items():
+            # support for explicit filename
+            ft = None
+            fh = None
+            if isinstance(v, (tuple, list)):
+                if len(v) == 2:
+                    fn, fp = v
+                elif len(v) == 3:
+                    fn, fp, ft = v
+                else:
+                    fn, fp, ft, fh = v
+            else:
+                fn = guess_filename(v) or k
+                fp = v
+
+            if isinstance(fp, (str, bytes, bytearray)):
+                fdata = fp
+            else:
+                fdata = fp.read()
+
+            rf = RequestField(name=k, data=fdata,
+                              filename=fn, headers=fh)
+            rf.make_multipart(content_type=ft)
+            new_fields.append(rf)
+
+        body, content_type = encode_multipart_formdata(new_fields)
+        return body,content_type
